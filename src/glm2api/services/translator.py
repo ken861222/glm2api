@@ -32,6 +32,54 @@ POWERSHELL_CMDLET_PATTERN = re.compile(r"^[A-Z][A-Za-z]+-[A-Z][A-Za-z]+$")
 POWERSHELL_ALIASES = {"cat", "cd", "copy", "del", "dir", "echo", "erase", "ls", "md", "move", "pwd", "rd", "ren", "rm", "sc", "type"}
 
 
+def fold_incremental_into(
+    sink: list[str],
+    accumulators: dict[str, str],
+    logic_id: str,
+    incoming: str,
+    authoritative: bool = False,
+) -> None:
+    """Fold ``incoming`` into ``accumulators[logic_id]``.
+    Appends only the newly revealed suffix to ``sink`` (empty when the event
+    carried nothing new). Mutates both arguments in place.
+    """
+    previous = accumulators.get(logic_id, "")
+    updated = fold_incremental(previous, incoming, authoritative=authoritative)
+    if len(updated) > len(previous):
+        sink.append(updated[len(previous):])
+    accumulators[logic_id] = updated
+
+
+def fold_incremental(accumulated: str, incoming: str, authoritative: bool = False) -> str:
+    """Fold one upstream segment into the accumulated text of a single part.
+
+    The upstream mixes three shapes on the same ``logic_id``:
+
+    * incremental fragments that extend the current text ("1", then "\n2"),
+    * a *superset rewrite* that repeats the text so far and may extend it
+      ("#", then "# 快"), which must replace rather than be appended,
+    * ``status == "finish"`` events carrying the complete part text, which are
+      authoritative even when they are not an extension at all (the upstream
+      sometimes re-sends a corrected snapshot, e.g. "1, 2, 3, 4, 5" after the
+      fragments "1"/"\n2"/"\n3\n4\n5").
+
+    So: append only when neither segment contains the other, replace on a
+    superset rewrite, and never append a divergent authoritative payload — it
+    cannot retract text that was already streamed. This is what keeps the
+    streamed text equal to the final part text.
+    """
+    if not incoming:
+        return accumulated
+    if not accumulated:
+        return incoming
+    if accumulated.startswith(incoming):
+        return accumulated
+    if incoming.startswith(accumulated):
+        return incoming
+    if authoritative:
+        return accumulated
+    return accumulated + incoming
+
 
 def extract_text_content(content: object) -> str:
     if isinstance(content, str):
@@ -481,8 +529,13 @@ class GLMEventAccumulator:
     ordered_logic_ids: list[str] = field(default_factory=list)
     last_full_text: str = ""
     last_full_reasoning: str = ""
-    _part_text_sent: dict[str, int] = field(default_factory=dict)
-    _part_reasoning_sent: dict[str, int] = field(default_factory=dict)
+    # Emitted text per logic_id (the fold of every fragment seen for that part).
+    # The upstream mixes two shapes for the same logic_id: incremental
+    # fragments ("诗句", "：**", ...) and, at the end, a cumulative snapshot
+    # that repeats the whole text. Diff-by-length mangles the former; see
+    # fold_incremental.
+    _accum_text: dict[str, str] = field(default_factory=dict)
+    _accum_reasoning: dict[str, str] = field(default_factory=dict)
     _known_logic_ids_for_text: list[str] = field(default_factory=list)
     _known_logic_ids_for_reasoning: list[str] = field(default_factory=list)
     tool_parser: StreamingToolParser = field(default_factory=StreamingToolParser)
@@ -492,6 +545,14 @@ class GLMEventAccumulator:
     _cached_full_reasoning: str = ""
     _cached_part_texts: dict[str, str] = field(default_factory=dict)
     _cached_part_reasonings: dict[str, str] = field(default_factory=dict)
+    # Unstripped per-part text/reasoning. Folding must see the raw fragments:
+    # stripping would glue "满园春色关不住**\n\n" and "**解释：**" together and
+    # make the trailing snapshot look like new content again.
+    _cached_part_raw_texts: dict[str, str] = field(default_factory=dict)
+    _cached_part_raw_reasonings: dict[str, str] = field(default_factory=dict)
+    # Last SSE status reported for each part. "finish" means the payload is the
+    # complete text (authoritative); "init" means it is another fragment.
+    _part_status: dict[str, str] = field(default_factory=dict)
     _server_side_tool_calls: list[dict[str, object]] = field(default_factory=list)
     _server_side_tool_call_ids: set[str] = field(default_factory=set)
     _deferred_visible_text: str = ""
@@ -510,6 +571,7 @@ class GLMEventAccumulator:
                 if logic_id not in self.parts_by_logic_id:
                     insort(self.ordered_logic_ids, logic_id)
                 self.parts_by_logic_id[logic_id] = part
+                self._part_status[logic_id] = str(part.get("status") or "")
                 self._render_cache_dirty = True
             # Extract server-side native tool_calls from content items
             if isinstance(part, dict) and isinstance(part.get("content"), list):
@@ -797,29 +859,32 @@ class GLMEventAccumulator:
             rendered_text = self._cached_part_texts.get(logic_id, "")
             rendered_reasoning = self._cached_part_reasonings.get(logic_id, "")
 
-            if rendered_text:
-                prev_len = self._part_text_sent.get(logic_id, 0)
-                is_new = logic_id not in self._known_logic_ids_for_text
-                if is_new:
-                    self._known_logic_ids_for_text.append(logic_id)
-                    if text_delta_parts or self._part_text_sent:
-                        text_delta_parts.append("\n\n")
-                    text_delta_parts.append(rendered_text)
-                elif len(rendered_text) > prev_len:
-                    text_delta_parts.append(rendered_text[prev_len:])
-                self._part_text_sent[logic_id] = len(rendered_text)
+            raw_text = self._cached_part_raw_texts.get(logic_id, "")
+            raw_reasoning = self._cached_part_raw_reasonings.get(logic_id, "")
 
-            if rendered_reasoning:
-                prev_len = self._part_reasoning_sent.get(logic_id, 0)
-                is_new = logic_id not in self._known_logic_ids_for_reasoning
-                if is_new:
+            authoritative = self._part_status.get(logic_id) == "finish"
+
+            if raw_text:
+                if logic_id not in self._known_logic_ids_for_text:
+                    self._known_logic_ids_for_text.append(logic_id)
+                    if text_delta_parts or self._accum_text:
+                        text_delta_parts.append("\n\n")
+                fold_incremental_into(
+                    text_delta_parts, self._accum_text, logic_id, raw_text, authoritative=authoritative
+                )
+
+            if raw_reasoning:
+                if logic_id not in self._known_logic_ids_for_reasoning:
                     self._known_logic_ids_for_reasoning.append(logic_id)
-                    if reasoning_delta_parts or self._part_reasoning_sent:
+                    if reasoning_delta_parts or self._accum_reasoning:
                         reasoning_delta_parts.append("\n\n")
-                    reasoning_delta_parts.append(rendered_reasoning)
-                elif len(rendered_reasoning) > prev_len:
-                    reasoning_delta_parts.append(rendered_reasoning[prev_len:])
-                self._part_reasoning_sent[logic_id] = len(rendered_reasoning)
+                fold_incremental_into(
+                    reasoning_delta_parts,
+                    self._accum_reasoning,
+                    logic_id,
+                    raw_reasoning,
+                    authoritative=authoritative,
+                )
 
         return "".join(text_delta_parts), "".join(reasoning_delta_parts)
 
@@ -831,6 +896,8 @@ class GLMEventAccumulator:
         reasoning_parts: list[str] = []
         self._cached_part_texts.clear()
         self._cached_part_reasonings.clear()
+        self._cached_part_raw_texts.clear()
+        self._cached_part_raw_reasonings.clear()
         for logic_id in self.ordered_logic_ids:
             part = self.parts_by_logic_id.get(logic_id)
             if not isinstance(part, dict):
@@ -860,14 +927,20 @@ class GLMEventAccumulator:
                             if isinstance(image, dict) and image.get("image_url"):
                                 part_text.append(f"![image]({image['image_url']})")
 
-            rendered_text = "\n".join(filter(None, part_text)).strip()
-            rendered_reasoning = "\n".join(filter(None, part_reasoning)).strip()
-            if rendered_text:
-                text_parts.append(rendered_text)
+            raw_text = "\n".join(filter(None, part_text))
+            raw_reasoning = "\n".join(filter(None, part_reasoning))
+            rendered_text = raw_text.strip()
+            rendered_reasoning = raw_reasoning.strip()
+            if raw_text:
                 self._cached_part_texts[logic_id] = rendered_text
-            if rendered_reasoning:
-                reasoning_parts.append(rendered_reasoning)
+                self._cached_part_raw_texts[logic_id] = raw_text
+                if rendered_text:
+                    text_parts.append(rendered_text)
+            if raw_reasoning:
                 self._cached_part_reasonings[logic_id] = rendered_reasoning
+                self._cached_part_raw_reasonings[logic_id] = raw_reasoning
+                if rendered_reasoning:
+                    reasoning_parts.append(rendered_reasoning)
 
         self._cached_full_text = "\n\n".join(text_parts)
         self._cached_full_reasoning = "\n\n".join(reasoning_parts)
