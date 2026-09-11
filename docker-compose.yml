@@ -1,0 +1,36 @@
+services:
+  glm2api:
+    build: .
+    image: glm2api:local
+    container_name: glm2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - HOST=0.0.0.0
+      - PORT=8000
+      - API_PREFIX=/v1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SERVER_API_KEYS=${SERVER_API_KEYS:?set SERVER_API_KEYS in .env}
+      - GLM_TOKEN_FILE=/app/data/token.txt
+      - GLM_REFRESH_TOKEN=${GLM_REFRESH_TOKEN:-}
+      - GLM_USE_GUEST_REFRESH_TOKEN=${GLM_USE_GUEST_REFRESH_TOKEN:-false}
+      - GLM_MAX_CONCURRENCY=${GLM_MAX_CONCURRENCY:-3}
+      - GLM_QUEUE_WAIT_TIMEOUT_SECONDS=${GLM_QUEUE_WAIT_TIMEOUT_SECONDS:-600}
+      - GLM_DELETE_CONVERSATION=${GLM_DELETE_CONVERSATION:-true}
+      - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-120}
+      - CORS_ALLOW_ORIGIN=${CORS_ALLOW_ORIGIN:-*}
+    ports:
+      - "${PORT:-8001}:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

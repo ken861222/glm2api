@@ -1,3 +1,5 @@
+import json
+
 from glm2api.services.translator import (
     BLOCKED_NATIVE_TOOL_NAMES,
     GLMEventAccumulator,
@@ -599,3 +601,117 @@ def test_accumulator_keeps_markdown_block_separators_between_parts():
         "## 查询结果：IP 地址 `1.1.1.1` 的归属地信息\n\n"
         "| 字段 | 值 |\n|---|---|\n| 查询 IP | `1.1.1.1` |"
     )
+
+
+def _stream_text_of(accumulator, particles):
+    """Replay raw upstream particles (text, status) and return the streamed text.
+
+    ``status`` mirrors the SSE field: "init" fragments are appended, "finish"
+    payloads are the complete part text.
+    """
+    streamed = ""
+    for text, status in particles:
+        chunks, _ = accumulator.consume_event(
+            {
+                "conversation_id": "conv_fold",
+                "parts": [
+                    {
+                        "logic_id": "p1",
+                        "status": status,
+                        "content": [{"type": "text", "text": text}],
+                    }
+                ],
+            }
+        )
+        for chunk in chunks:
+            payload = chunk.split("data: ", 1)[1].strip()
+            delta = json.loads(payload)["choices"][0]["delta"]
+            streamed += delta.get("content", "")
+    return streamed
+
+
+def test_accumulator_streaming_folds_fragments_then_snapshot_without_duplicating():
+    # Real capture: the upstream first streams fragments on one logic_id, then
+    # repeats the complete text as a snapshot on the same logic_id. Diffing by
+    # length used to slice the snapshot from a fragment-relative offset and
+    # mangle the sentence.
+    fragments = ["诗句", "：**", "满园春色关不住**\n\n", "出自"]
+    snapshot = "诗句：**满园春色关不住**\n\n出自宋代叶绍翁的《游园不值》。"
+    particles = [(t, "init") for t in fragments] + [(snapshot, "finish"), (snapshot, "finish")]
+
+    accumulator = GLMEventAccumulator(model="glm-test")
+    streamed = _stream_text_of(accumulator, particles)
+
+    assert streamed == snapshot
+    assert accumulator.build_response()["choices"][0]["message"]["content"] == snapshot
+
+
+def test_accumulator_streaming_counts_increments_then_snapshot():
+    particles = [
+        ("1", "init"),
+        ("\n2", "init"),
+        ("\n3\n4\n5", "init"),
+        ("1\n2\n3\n4\n5", "finish"),
+        ("1\n2\n3\n4\n5", "finish"),
+    ]
+
+    accumulator = GLMEventAccumulator(model="glm-test")
+    streamed = _stream_text_of(accumulator, particles)
+
+    assert streamed == "1\n2\n3\n4\n5"
+    assert accumulator.build_response()["choices"][0]["message"]["content"] == "1\n2\n3\n4\n5"
+
+
+def test_accumulator_streaming_fragment_that_extends_previous_is_not_swallowed():
+    # Real capture: fragments legitimately extend their predecessor ("#", then
+    # "# 快"), so a prefix relationship alone must not be treated as a repeat.
+    accumulator = GLMEventAccumulator(model="glm-test")
+    streamed = _stream_text_of(
+        accumulator,
+        [("#", "init"), ("# 快速排序算法", "init")],
+    )
+
+    assert streamed == "# 快速排序算法"
+
+
+def test_accumulator_streaming_divergent_finish_snapshot_is_not_appended():
+    # If the authoritative payload disagrees with the fragments (a rewritten
+    # snapshot), it must not be appended: the text was already streamed and a
+    # second copy would garble the answer. The streamed fragments stand.
+    particles = [("1\n2\n3", "init"), ("\n4\n5", "init"), ("1, 2, 3, 4, 5", "finish")]
+
+    accumulator = GLMEventAccumulator(model="glm-test")
+    streamed = _stream_text_of(accumulator, particles)
+
+    assert streamed == "1\n2\n3\n4\n5"
+
+
+def test_accumulator_streaming_preserves_whitespace_only_fragment():
+    # Real capture: the upstream emits a bare "\n\n" fragment between blocks.
+    # Stripping it dropped the paragraph break and glued the table to the next
+    # heading ("...数组 |### 空间复杂度").
+    particles = [
+        ("| 平均情况 | O(n²) | 随机排列的数组 |", "init"),
+        ("\n\n", "init"),
+        ("### 空间复杂度", "init"),
+    ]
+
+    accumulator = GLMEventAccumulator(model="glm-test")
+    streamed = _stream_text_of(accumulator, particles)
+
+    assert streamed == "| 平均情况 | O(n²) | 随机排列的数组 |\n\n### 空间复杂度"
+
+
+def test_accumulator_streaming_matches_final_snapshot_for_real_fragment_capture():
+    # Shape taken from a real capture: many init fragments followed by the
+    # complete text twice. The stream must reproduce that final text exactly.
+    fragments = ["# ", "Pyth", "on冒泡", "排序教程\n\n## 📚 目录\n1.", " 算法原理\n2. 基础实现\n"]
+    snapshot = "# Python冒泡排序教程\n\n## 📚 目录\n1. 算法原理\n2. 基础实现\n"
+    particles = [(t, "init") for t in fragments] + [(snapshot, "finish"), (snapshot, "finish")]
+
+    accumulator = GLMEventAccumulator(model="glm-test")
+    streamed = _stream_text_of(accumulator, particles)
+
+    assert streamed == snapshot
+    # build_response() strips each rendered part, dropping the trailing newline.
+    assert accumulator.build_response()["choices"][0]["message"]["content"] == snapshot.strip()
